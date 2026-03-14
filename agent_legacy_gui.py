@@ -1,7 +1,7 @@
 # =========================================================================
 #  A.X.I.S. — LEGACY GUI ENTRYPOINT (preserved for future use)
 #
-#  This file contains the original Tkinter/GUI-based runtime.
+#  This is a preserved copy of the original Tkinter-based runtime.
 #  It is NOT the active entrypoint. Use axis.py instead.
 #
 #  Copyright (c) 2026 brenpoly (upstream), Wil-1302 (adaptaciones)
@@ -12,7 +12,6 @@
 #  This software is provided "as is", without warranty of any kind.
 # =========================================================================
 # NOTE: GUI runtime — requires display server and Tkinter.
-#       Not compatible with headless/terminal-only environments.
 #       For the active terminal-first A.X.I.S., run: python axis.py
 # =========================================================================
 
