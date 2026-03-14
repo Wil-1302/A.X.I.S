@@ -75,12 +75,16 @@ DEFAULT_CONFIG = {
     "chat_memory": True,
     "system_prompt_extras": "",
     # Audio tuning
-    "silence_threshold": 0.010,   # RMS threshold (0.0–1.0) — raise if cuts off too early
-    "silence_duration": 2.0,      # seconds of silence before stopping
+    "silence_threshold": 0.015,   # RMS threshold (0.0–1.0) — raise if room noise keeps recording
+    "silence_duration": 1.5,      # seconds of silence before stopping
     "min_speech_duration": 0.5,   # seconds of speech required before silence detection activates
     "max_record_time": 30.0,
+    # noise_floor_multiplier: effective threshold = max(silence_threshold, noise_floor * multiplier)
+    "noise_floor_multiplier": 2.0,
     # Debug: save last recording to last_recording.wav for manual inspection
     "debug_audio": True,
+    # Wake word: set to true to enable "hey axis" trigger; false = Enter/PTT only (recommended for testing)
+    "use_wake_word": False,
 }
 
 OLLAMA_OPTIONS = {
@@ -108,12 +112,14 @@ WHISPER_MODEL = _p("whisper.cpp", "models", CURRENT_CONFIG.get("whisper_model", 
 SEARCH_REGION = "es-es" if LANGUAGE == "es" else "us-en"
 
 # Audio tuning — read once from config
-SILENCE_THRESHOLD    = float(CURRENT_CONFIG.get("silence_threshold", 0.010))
-SILENCE_DURATION     = float(CURRENT_CONFIG.get("silence_duration", 2.0))
+SILENCE_THRESHOLD    = float(CURRENT_CONFIG.get("silence_threshold", 0.015))
+SILENCE_DURATION     = float(CURRENT_CONFIG.get("silence_duration", 1.5))
 MIN_SPEECH_DURATION  = float(CURRENT_CONFIG.get("min_speech_duration", 0.5))
 MAX_RECORD_TIME      = float(CURRENT_CONFIG.get("max_record_time", 30.0))
+NOISE_FLOOR_MULT     = float(CURRENT_CONFIG.get("noise_floor_multiplier", 2.0))
 WHISPER_THREADS      = int(CURRENT_CONFIG.get("whisper_threads", 4))
 DEBUG_AUDIO          = bool(CURRENT_CONFIG.get("debug_audio", True))
+USE_WAKE_WORD        = bool(CURRENT_CONFIG.get("use_wake_word", False))
 
 # Fixed target rate for Whisper (it internally works at 16 kHz)
 WHISPER_SAMPLE_RATE = 16000
@@ -171,7 +177,7 @@ def banner():
     print("  ╔═══════════════════════════════════════╗", flush=True)
     print("  ║   A . X . I . S .                    ║", flush=True)
     print("  ║   Autonomous eXtended Intelligence   ║", flush=True)
-    print("  ║   System  —  Arch Linux  —  v0.5     ║", flush=True)
+    print("  ║   System  —  Arch Linux  —  v0.7     ║", flush=True)
     print("  ╚═══════════════════════════════════════╝", flush=True)
     print(f"{C.RESET}", flush=True)
 
@@ -209,10 +215,14 @@ class AxisTerminal:
 
         atexit.register(self.safe_exit)
 
-        # Wake word
-        print(f"{C.GRAY}[INIT] Cargando modelo de palabra de activación...{C.RESET}", flush=True)
+        # Wake word — disabled by default for testing (set use_wake_word: true in config.json to enable)
         self.oww_model = None
-        if os.path.exists(WAKE_WORD_MODEL):
+        if not USE_WAKE_WORD:
+            print(f"{C.YELLOW}[INIT] Wake word desactivado (use_wake_word=false) — modo PTT/Enter activo.{C.RESET}", flush=True)
+        elif not os.path.exists(WAKE_WORD_MODEL):
+            print(f"{C.YELLOW}[AVISO] No se encontró wakeword.onnx — usando modo PTT (Enter).{C.RESET}", flush=True)
+        else:
+            print(f"{C.GRAY}[INIT] Cargando modelo de palabra de activación...{C.RESET}", flush=True)
             try:
                 self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
                 print(f"{C.GREEN}[INIT] Wake word cargado.{C.RESET}", flush=True)
@@ -224,8 +234,6 @@ class AxisTerminal:
                     print(f"{C.RED}[CRÍTICO] Fallo al cargar wake word: {e}{C.RESET}", flush=True)
             except Exception as e:
                 print(f"{C.RED}[CRÍTICO] Fallo al cargar wake word: {e}{C.RESET}", flush=True)
-        else:
-            print(f"{C.YELLOW}[AVISO] No se encontró wakeword.onnx — usando modo PTT (Enter).{C.RESET}", flush=True)
 
     # -------------------------------------------------------------------------
     # Terminal I/O
@@ -465,19 +473,34 @@ class AxisTerminal:
         chunk_size        = int(samplerate * chunk_duration)
         num_silent_chunks = int(SILENCE_DURATION / chunk_duration)
         max_chunks        = int(MAX_RECORD_TIME / chunk_duration)
-        # Minimum speech chunks before silence detection activates
         min_speech_chunks = int(MIN_SPEECH_DURATION / chunk_duration)
 
-        print(f"  {C.GRAY}[MIC] Tasa: {samplerate} Hz | "
-              f"Umbral silencio: {SILENCE_THRESHOLD:.3f} | "
-              f"Silencio tras: {SILENCE_DURATION:.1f}s | "
-              f"Mín. habla: {MIN_SPEECH_DURATION:.1f}s{C.RESET}", flush=True)
+        # --- Sample ambient noise floor to compute an adaptive threshold ---
+        effective_threshold = SILENCE_THRESHOLD
+        try:
+            noise_samples = []
+            with sd.InputStream(samplerate=samplerate, channels=1, dtype='float32',
+                                 blocksize=chunk_size, device=INPUT_DEVICE_NAME) as ns:
+                for _ in range(10):  # ~500 ms
+                    data, _ = ns.read(chunk_size)
+                    noise_samples.append(np.linalg.norm(data) / np.sqrt(len(data)))
+            noise_floor = float(np.mean(noise_samples))
+            effective_threshold = max(SILENCE_THRESHOLD, noise_floor * NOISE_FLOOR_MULT)
+            print(f"  {C.GRAY}[MIC] Tasa: {samplerate} Hz | "
+                  f"Ruido ambiente: {noise_floor:.4f} | "
+                  f"Umbral efectivo: {effective_threshold:.4f} | "
+                  f"Silencio tras: {SILENCE_DURATION:.1f}s{C.RESET}", flush=True)
+        except Exception:
+            print(f"  {C.GRAY}[MIC] Tasa: {samplerate} Hz | "
+                  f"Umbral: {effective_threshold:.4f} (base) | "
+                  f"Silencio tras: {SILENCE_DURATION:.1f}s{C.RESET}", flush=True)
+
         print(f"  {C.GREEN}[MIC] Grabando... (habla ahora){C.RESET}", flush=True)
 
         buffer           = []
         silent_chunks    = 0
         recorded_chunks  = 0
-        speech_chunks    = 0   # chunks above threshold
+        speech_chunks    = 0
         silence_started  = False
         record_start     = time.time()
 
@@ -489,7 +512,7 @@ class AxisTerminal:
             buffer.append(indata.copy())
             recorded_chunks += 1
 
-            if volume_rms >= SILENCE_THRESHOLD:
+            if volume_rms >= effective_threshold:
                 speech_chunks += 1
                 silent_chunks  = 0
             else:
@@ -510,8 +533,13 @@ class AxisTerminal:
             return None
 
         duration = time.time() - record_start
-        print(f"  {C.GRAY}[MIC] Grabación terminada — {duration:.2f}s "
-              f"({speech_chunks} chunks de habla detectados){C.RESET}", flush=True)
+        if silence_started:
+            stop_reason = f"{C.GREEN}silencio detectado{C.RESET}"
+        else:
+            stop_reason = f"{C.YELLOW}tiempo máximo ({MAX_RECORD_TIME:.0f}s){C.RESET}"
+        print(f"  {C.GRAY}[MIC] Grabación terminada ({stop_reason}{C.GRAY}) — "
+              f"{duration:.2f}s | {speech_chunks} chunks habla | "
+              f"{silent_chunks} chunks silencio final{C.RESET}", flush=True)
 
         if speech_chunks < min_speech_chunks:
             print(f"  {C.YELLOW}[MIC] Habla insuficiente detectada — ignorando.{C.RESET}", flush=True)
@@ -598,6 +626,18 @@ class AxisTerminal:
         self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filepath
 
+    def clean_transcription(self, text):
+        """Strip whisper artifacts and noise markers from raw transcript text."""
+        # Remove special tokens: [_EOT_], [_BEG_], [_TT_NNN], [BLANK_AUDIO], etc.
+        text = re.sub(r'\[_[A-Z0-9_]+\]', '', text)
+        text = re.sub(r'\[BLANK_AUDIO\]', '', text, flags=re.IGNORECASE)
+        # Remove music / sound markers (♪ ♫) and parenthetical noise tags like (music)
+        text = re.sub(r'[♪♫🎵🎶]', '', text)
+        text = re.sub(r'\([^)]{1,40}\)', '', text)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
     def transcribe_audio(self, filename):
         self.set_state(BotStates.THINKING, "Transcribiendo audio...")
 
@@ -621,7 +661,7 @@ class AxisTerminal:
             "-l", LANGUAGE,          # force Spanish
             "-t", str(WHISPER_THREADS),
             "--no-timestamps",       # cleaner output, easier to parse
-            "--print-special", "false",   # suppress <SOT>, <EOT>, etc.
+            # NOTE: do NOT pass --print-special; omitting it keeps special tokens suppressed by default.
         ]
 
         print(f"  {C.GRAY}[STT] Comando: {' '.join(cmd)}{C.RESET}", flush=True)
@@ -666,8 +706,8 @@ class AxisTerminal:
                     transcript_parts.append(line)
 
             transcription = " ".join(transcript_parts).strip()
-            # Collapse multiple spaces
-            transcription = re.sub(r'\s+', ' ', transcription)
+            # Strip whisper artifacts and normalize whitespace
+            transcription = self.clean_transcription(transcription)
 
             if transcription:
                 print(f"  {C.GREEN}[STT] Transcripción: \"{transcription}\"{C.RESET}", flush=True)
@@ -707,7 +747,13 @@ class AxisTerminal:
 
         self.set_state(BotStates.THINKING, "Pensando...")
 
-        user_msg = {"role": "user", "content": text}
+        # Inject a per-turn Spanish reminder for small models that may drift to English.
+        # The reminder is sent to the LLM but NOT stored in memory or shown to the user.
+        if LANGUAGE == "es":
+            llm_content = text + "\n\n(IMPORTANTE: responde ÚNICAMENTE en español, nunca en inglés.)"
+        else:
+            llm_content = text
+        user_msg = {"role": "user", "content": llm_content}
         messages = self.permanent_memory + self.session_memory + [user_msg]
 
         self.thinking_sound_active.set()
@@ -795,8 +841,8 @@ class AxisTerminal:
 
                     elif tool_result:
                         summary_prompt = [
-                            {"role": "system", "content": "Resume este resultado en una frase corta en español."},
-                            {"role": "user",   "content": f"RESULTADO: {tool_result}\nPregunta original: {text}"}
+                            {"role": "system", "content": "Eres un asistente que SIEMPRE responde en español. Resume el siguiente resultado en UNA frase corta en español. NUNCA respondas en inglés."},
+                            {"role": "user",   "content": f"RESULTADO: {tool_result}\nPregunta original: {text}\n\n(Responde en español.)"}
                         ]
                         self.set_state(BotStates.THINKING, "Leyendo resultados...")
                         self.thinking_sound_active.set()

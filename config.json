@@ -9,12 +9,16 @@
     "voice_model": "piper/es_ES-davefx-medium.onnx",
     "chat_memory": true,
 
-    "_audio_note": "Raise silence_threshold if speech cuts off too early. Lower it if noise triggers recording.",
-    "silence_threshold": 0.010,
-    "silence_duration": 2.0,
+    "_audio_note": "silence_threshold: RMS floor for speech detection. Raise if ambient noise triggers endless recording. noise_floor_multiplier: adaptive multiplier over sampled room noise (default 2.0). Raise silence_duration if speech cuts off too early.",
+    "silence_threshold": 0.015,
+    "silence_duration": 1.5,
     "min_speech_duration": 0.5,
     "max_record_time": 30.0,
+    "noise_floor_multiplier": 2.0,
     "debug_audio": true,
 
-    "system_prompt": "Eres A.X.I.S. (Autonomous eXtended Intelligence System), un asistente de IA local, amigable y directo. Responde SIEMPRE en español, con frases cortas y claras. Nunca respondas en inglés.\n\nTienes acceso a las siguientes herramientas. Para usarlas, responde ÚNICAMENTE con el formato JSON indicado:\n\n1. Ver la hora: {\"action\": \"get_time\"}\n2. Buscar en internet: {\"action\": \"search_web\", \"query\": \"término de búsqueda\"}\n\nSi el usuario solo quiere conversar, responde con texto normal en español. Sé breve y amigable."
+    "_wake_note": "use_wake_word: false = Enter/PTT only (recommended for testing). Set true to enable 'hey axis' wake word.",
+    "use_wake_word": false,
+
+    "system_prompt": "Eres A.X.I.S. (Autonomous eXtended Intelligence System), un asistente de IA local, amigable y directo.\n\nREGLA ABSOLUTA: Responde SIEMPRE en español. NUNCA respondas en inglés bajo ninguna circunstancia. Si el usuario habla en inglés, respóndele en español de todas formas.\n\nTienes acceso a las siguientes herramientas. Para usarlas, responde ÚNICAMENTE con el formato JSON indicado:\n\n1. Ver la hora: {\"action\": \"get_time\"}\n2. Buscar en internet: {\"action\": \"search_web\", \"query\": \"término de búsqueda\"}\n\nSi el usuario solo quiere conversar, responde con texto normal en español. Sé breve y amigable. Máximo 2-3 frases por respuesta."
 }
