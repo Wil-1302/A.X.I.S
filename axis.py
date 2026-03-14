@@ -177,7 +177,7 @@ def banner():
     print("  ╔═══════════════════════════════════════╗", flush=True)
     print("  ║   A . X . I . S .                    ║", flush=True)
     print("  ║   Autonomous eXtended Intelligence   ║", flush=True)
-    print("  ║   System  —  Arch Linux  —  v0.8     ║", flush=True)
+    print("  ║   System  —  Arch Linux  —  v0.9     ║", flush=True)
     print("  ╚═══════════════════════════════════════╝", flush=True)
     print(f"{C.RESET}", flush=True)
 
@@ -290,6 +290,28 @@ class AxisTerminal:
             pass
 
     # -------------------------------------------------------------------------
+    # Stdin drain — prevents buffered Enter presses from immediately triggering
+    # a new recording cycle after TTS finishes.
+    # -------------------------------------------------------------------------
+
+    def _drain_stdin(self):
+        """Discard all stdin bytes currently waiting in the buffer."""
+        import fcntl
+        fd = sys.stdin.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, 1024)
+                    if not chunk:
+                        break
+                except (BlockingIOError, OSError):
+                    break
+        finally:
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl)
+
+    # -------------------------------------------------------------------------
     # Action router (camera disabled for terminal phase)
     # -------------------------------------------------------------------------
 
@@ -359,7 +381,13 @@ class AxisTerminal:
 
         while True:
             try:
-                trigger_source = self.detect_wake_word_or_ptt()
+                # Drain any buffered stdin before waiting for trigger.
+                # This prevents Enter presses during TTS/processing from
+                # immediately firing the next recording cycle.
+                self._drain_stdin()
+
+                self.detect_wake_word_or_ptt()
+
                 if self.interrupted.is_set():
                     self.interrupted.clear()
                     self.set_state(BotStates.IDLE, "Reiniciando...")
@@ -367,10 +395,9 @@ class AxisTerminal:
 
                 self.set_state(BotStates.LISTENING, "¡Te escucho!")
 
-                if trigger_source == "PTT":
-                    audio_file = self.record_voice_ptt()
-                else:
-                    audio_file = self.record_voice_adaptive()
+                # Always use adaptive silence detection — do not require a
+                # second Enter to stop recording (was the PTT stop mechanism).
+                audio_file = self.record_voice_adaptive()
 
                 if not audio_file:
                     self.set_state(BotStates.IDLE, "No escuché nada.")
@@ -400,7 +427,7 @@ class AxisTerminal:
             ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
         except Exception as e:
             print(f"  {C.YELLOW}[AVISO] Error cargando {TEXT_MODEL}: {e}{C.RESET}", flush=True)
-        self.play_sound(self.get_random_sound(greeting_sounds_dir))
+        # No greeting sound — avoids upstream English audio files at startup.
         print(f"  {C.GREEN}[INIT] Modelos cargados. A.X.I.S. listo.{C.RESET}\n", flush=True)
 
     def detect_wake_word_or_ptt(self):
@@ -412,12 +439,12 @@ class AxisTerminal:
 
         if self.oww_model is None:
             # PTT mode: block on stdin until the user presses Enter.
-            # ptt_event is kept for optional external triggers (hotkey, signal).
-            # If ptt_event is already set (external trigger), use it immediately.
+            # Recording then starts and stops automatically via silence detection.
             if not self.ptt_event.is_set():
                 sys.stdout.write(
                     f"\n  {C.GRAY}──────────────────────────────────────────────\n"
                     f"  [ Enter para hablar  |  Ctrl+C para salir ]\n"
+                    f"  (la grabación se detiene sola al detectar silencio)\n"
                     f"  ──────────────────────────────────────────────{C.RESET}\n"
                 )
                 sys.stdout.flush()
@@ -471,6 +498,7 @@ class AxisTerminal:
             sys.stdout.write(
                 f"\n  {C.GRAY}──────────────────────────────────────────────\n"
                 f"  [ Enter para hablar  |  Ctrl+C para salir ]\n"
+                f"  (la grabación se detiene sola al detectar silencio)\n"
                 f"  ──────────────────────────────────────────────{C.RESET}\n"
             )
             sys.stdout.flush()
@@ -481,8 +509,7 @@ class AxisTerminal:
             return "PTT"
 
     def record_voice_adaptive(self, filename="input.wav"):
-        self.set_state(BotStates.LISTENING, "Grabando (detección de silencio)...")
-        time.sleep(0.3)  # brief gap after state change sound
+        self.set_state(BotStates.LISTENING, "Grabando (habla ahora, para sola al detectar silencio)...")
 
         try:
             samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
@@ -568,8 +595,9 @@ class AxisTerminal:
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename="input.wav"):
+        # NOTE: record_voice_ptt is no longer called from run() — kept for
+        # optional manual use only. run() now always uses record_voice_adaptive().
         self.set_state(BotStates.LISTENING, "Grabando (PTT — Enter para detener)...")
-        time.sleep(0.3)
 
         try:
             samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
@@ -643,7 +671,7 @@ class AxisTerminal:
             except Exception:
                 pass
 
-        self.play_sound(self.get_random_sound(ack_sounds_dir))
+        # No ack sound — avoids upstream English audio files.
         return filepath
 
     def clean_transcription(self, text):
@@ -997,11 +1025,10 @@ class AxisTerminal:
     # -------------------------------------------------------------------------
 
     def _run_thinking_sound_loop(self):
+        # Thinking audio sounds are disabled — all upstream WAV files are English.
+        # State is tracked via thinking_sound_active event for flow control only.
         time.sleep(0.5)
         while self.thinking_sound_active.is_set():
-            sound = self.get_random_sound(thinking_sounds_dir)
-            if sound:
-                self.play_sound(sound)
             for _ in range(50):
                 if not self.thinking_sound_active.is_set():
                     return
