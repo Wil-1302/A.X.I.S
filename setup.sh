@@ -78,16 +78,17 @@ else
     echo -e "${GREEN}  Piper binary already present.${NC}"
 fi
 
-# 4. Download Piper Voice Model
-echo -e "${YELLOW}[4/7] Downloading voice model...${NC}"
-if [ ! -f "piper/en_GB-semaine-medium.onnx" ]; then
-    wget -O piper/en_GB-semaine-medium.onnx \
-        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/semaine/medium/en_GB-semaine-medium.onnx"
-    wget -O piper/en_GB-semaine-medium.onnx.json \
-        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/semaine/medium/en_GB-semaine-medium.onnx.json"
-    echo -e "${GREEN}  Voice model downloaded.${NC}"
+# 4. Download Piper Voice Model (Spanish: es_ES-davefx-medium)
+echo -e "${YELLOW}[4/7] Downloading voice model (español)...${NC}"
+PIPER_VOICE="es_ES-davefx-medium"
+if [ ! -f "piper/${PIPER_VOICE}.onnx" ]; then
+    wget -O "piper/${PIPER_VOICE}.onnx" \
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx"
+    wget -O "piper/${PIPER_VOICE}.onnx.json" \
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json"
+    echo -e "${GREEN}  Modelo de voz descargado: ${PIPER_VOICE}${NC}"
 else
-    echo -e "${GREEN}  Voice model already present.${NC}"
+    echo -e "${GREEN}  Modelo de voz ya presente: ${PIPER_VOICE}${NC}"
 fi
 
 # 5. Build whisper.cpp (STT engine)
@@ -111,15 +112,16 @@ else
     echo -e "${GREEN}  whisper-cli already built.${NC}"
 fi
 
-# Download Whisper model (base.en)
-echo -e "${YELLOW}  Downloading Whisper model (ggml-base.en)...${NC}"
-if [ ! -f "whisper.cpp/models/ggml-base.en.bin" ]; then
-    mkdir -p whisper.cpp/models
-    wget -O whisper.cpp/models/ggml-base.en.bin \
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
-    echo -e "${GREEN}  Whisper model downloaded.${NC}"
+# Download Whisper model — multilingual base (supports Spanish and other languages)
+# Use ggml-base.bin instead of ggml-base.en.bin for multi-language STT
+echo -e "${YELLOW}  Descargando modelo Whisper (ggml-base multilingüe)...${NC}"
+mkdir -p whisper.cpp/models
+if [ ! -f "whisper.cpp/models/ggml-base.bin" ]; then
+    wget -O whisper.cpp/models/ggml-base.bin \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+    echo -e "${GREEN}  Modelo Whisper descargado.${NC}"
 else
-    echo -e "${GREEN}  Whisper model already present.${NC}"
+    echo -e "${GREEN}  Modelo Whisper ya presente.${NC}"
 fi
 
 # 6. Python Virtual Environment + Dependencies
@@ -161,9 +163,9 @@ check_file() {
 }
 
 check_file "whisper.cpp/build/bin/whisper-cli"    "whisper-cli binary"
-check_file "whisper.cpp/models/ggml-base.en.bin"  "whisper model"
+check_file "whisper.cpp/models/ggml-base.bin"     "whisper model (multilingüe)"
 check_file "piper/piper"                           "piper TTS binary"
-check_file "piper/en_GB-semaine-medium.onnx"       "piper voice model"
+check_file "piper/es_ES-davefx-medium.onnx"        "piper voice model (español)"
 check_file "wakeword.onnx"                         "wake word model"
 
 echo ""

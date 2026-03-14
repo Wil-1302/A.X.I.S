@@ -67,9 +67,9 @@ WAKE_WORD_MODEL  = _p("wakeword.onnx")
 WAKE_WORD_THRESHOLD = 0.5
 
 # Binaries — resolved at project root so the agent can be launched from anywhere
-WHISPER_CLI  = _p("whisper.cpp", "build", "bin", "whisper-cli")
-WHISPER_MODEL = _p("whisper.cpp", "models", "ggml-base.en.bin")
-PIPER_BIN    = _p("piper", "piper")
+WHISPER_CLI = _p("whisper.cpp", "build", "bin", "whisper-cli")
+PIPER_BIN   = _p("piper", "piper")
+# WHISPER_MODEL is resolved after config load (depends on "whisper_model" key)
 
 # HARDWARE SETTINGS
 INPUT_DEVICE_NAME = None
@@ -77,7 +77,9 @@ INPUT_DEVICE_NAME = None
 DEFAULT_CONFIG = {
     "text_model": "gemma3:1b",
     "vision_model": "moondream",
-    "voice_model": _p("piper", "en_GB-semaine-medium.onnx"),
+    "language": "es",
+    "whisper_model": "ggml-base.bin",
+    "voice_model": _p("piper", "es_ES-davefx-medium.onnx"),
     "chat_memory": True,
     "camera_rotation": 0,
     "system_prompt_extras": ""
@@ -104,8 +106,12 @@ def load_config():
     return config
 
 CURRENT_CONFIG = load_config()
-TEXT_MODEL = CURRENT_CONFIG["text_model"]
-VISION_MODEL = CURRENT_CONFIG["vision_model"]
+TEXT_MODEL    = CURRENT_CONFIG["text_model"]
+VISION_MODEL  = CURRENT_CONFIG["vision_model"]
+LANGUAGE      = CURRENT_CONFIG.get("language", "es")
+WHISPER_MODEL = _p("whisper.cpp", "models", CURRENT_CONFIG.get("whisper_model", "ggml-base.bin"))
+# Web search region derived from language (es→es-es, en→us-en, default es-es)
+SEARCH_REGION = "es-es" if LANGUAGE == "es" else "us-en"
 
 class BotStates:
     IDLE = "idle"             
@@ -117,33 +123,19 @@ class BotStates:
     WARMUP = "warmup"       
 
 # --- SYSTEM PROMPT ---
-# NOTE: kept in English for this phase. Spanish migration is planned for the next phase.
-BASE_SYSTEM_PROMPT = """You are a helpful robot assistant.
-Personality: Cute, helpful, robot.
-Style: Short sentences. Enthusiastic.
+# If config.json provides "system_prompt", it takes full priority.
+# The fallback below is used only when no config prompt is found.
+_FALLBACK_SYSTEM_PROMPT = (
+    "Eres A.X.I.S., un asistente de IA local. Responde siempre en español con frases cortas.\n\n"
+    "Para acciones físicas responde SOLO con JSON:\n"
+    '{"action": "get_time"} | {"action": "capture_image"} | {"action": "search_web", "query": "..."}\n\n'
+    "Para conversación normal, responde con texto."
+)
 
-INSTRUCTIONS:
-- If the user asks for a physical action (time, search, photo), output JSON.
-- If the user just wants to chat, reply with NORMAL TEXT.
-
-### EXAMPLES ###
-
-User: What time is it?
-You: {"action": "get_time", "value": "now"}
-
-User: Hello!
-You: Hi! I am ready to help!
-
-User: Search for news about robots.
-You: {"action": "search_web", "value": "robots news"}
-
-User: What do you see right now?
-You: {"action": "capture_image", "value": "environment"}
-
-### END EXAMPLES ###
-"""
-
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+if CURRENT_CONFIG.get("system_prompt"):
+    SYSTEM_PROMPT = CURRENT_CONFIG["system_prompt"]
+else:
+    SYSTEM_PROMPT = _FALLBACK_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
 
 # Sound Directories (absolute paths)
 greeting_sounds_dir = _p("sounds", "greeting_sounds")
@@ -221,7 +213,7 @@ class BotGUI:
         self.response_text = tk.Text(master, height=6, width=60, wrap=tk.WORD, 
                                      state=tk.DISABLED, bg="#ffffff", fg="#000000", font=('Arial', 12)) 
         
-        self.status_var = tk.StringVar(value="Initializing...")
+        self.status_var = tk.StringVar(value="Iniciando...")
         self.status_label = ttk.Label(master, textvariable=self.status_var, background="#2e2e2e", foreground="white")
         
         self.exit_button = ttk.Button(master, text="Exit & Save", command=self.safe_exit)
@@ -412,28 +404,28 @@ class BotGUI:
             return "INVALID_ACTION"
 
         if action == "get_time":
-            now = datetime.datetime.now().strftime("%I:%M %p")
-            return f"The current time is {now}."
+            now = datetime.datetime.now().strftime("%H:%M")
+            return f"Son las {now}."
         
         elif action == "search_web":
             print(f"Searching web for: {value}...", flush=True)
             try:
-                # 'us-en' region is often more stable for CLI queries
+                # Region derived from config "language" (es→es-es, en→us-en)
                 with DDGS() as ddgs:
                     results = []
                     # 1. News search
                     try:
-                        results = list(ddgs.news(value, region='us-en', max_results=1))
-                        if results: 
+                        results = list(ddgs.news(value, region=SEARCH_REGION, max_results=1))
+                        if results:
                             print(f"[DEBUG] Found News: {results[0].get('title')}", flush=True)
-                    except Exception as e: 
+                    except Exception as e:
                         print(f"[DEBUG] News Search Error: {e}", flush=True)
-                    
+
                     # 2. Text fallback
                     if not results:
                         print("[DEBUG] No news found, trying text search...", flush=True)
-                        try: 
-                            results = list(ddgs.text(value, region='us-en', max_results=1))
+                        try:
+                            results = list(ddgs.text(value, region=SEARCH_REGION, max_results=1))
                             if results: 
                                 print(f"[DEBUG] Found Text: {results[0].get('title')}", flush=True)
                         except Exception as e:
@@ -472,27 +464,27 @@ class BotGUI:
                 trigger_source = self.detect_wake_word_or_ptt()
                 if self.interrupted.is_set():
                     self.interrupted.clear()
-                    self.set_state(BotStates.IDLE, "Resetting...")
+                    self.set_state(BotStates.IDLE, "Reiniciando...")
                     continue
 
-                self.set_state(BotStates.LISTENING, "I'm listening!")
-                
+                self.set_state(BotStates.LISTENING, "¡Te escucho!")
+
                 audio_file = None
                 if trigger_source == "PTT":
                     audio_file = self.record_voice_ptt()
                 else:
                     audio_file = self.record_voice_adaptive()
-                
-                if not audio_file: 
-                    self.set_state(BotStates.IDLE, "Heard nothing.")
+
+                if not audio_file:
+                    self.set_state(BotStates.IDLE, "No escuché nada.")
                     continue
-                
+
                 user_text = self.transcribe_audio(audio_file)
                 if not user_text:
-                    self.set_state(BotStates.IDLE, "Transcription empty.")
+                    self.set_state(BotStates.IDLE, "Transcripción vacía.")
                     continue
-                
-                self.append_to_text(f"YOU: {user_text}")
+
+                self.append_to_text(f"TÚ: {user_text}")
                 self.interrupted.clear()
                 self.chat_and_respond(user_text, img_path=None)
                     
@@ -501,16 +493,16 @@ class BotGUI:
             self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
 
     def warm_up_logic(self):
-        self.set_state(BotStates.WARMUP, "Warming up brains...")
+        self.set_state(BotStates.WARMUP, "Calentando motores...")
         try:
             ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
         except Exception as e:
-            print(f"Failed to load {TEXT_MODEL}: {e}", flush=True)
+            print(f"[INIT] Error cargando {TEXT_MODEL}: {e}", flush=True)
         self.play_sound(self.get_random_sound(greeting_sounds_dir))
-        print("Models loaded.", flush=True)
+        print("[INIT] Modelos cargados.", flush=True)
 
     def detect_wake_word_or_ptt(self):
-        self.set_state(BotStates.IDLE, "Waiting...")
+        self.set_state(BotStates.IDLE, "Esperando...")
         self.ptt_event.clear()
         
         if self.oww_model: self.oww_model.reset()
@@ -654,7 +646,7 @@ class BotGUI:
             return ""
         try:
             result = subprocess.run(
-                [WHISPER_CLI, "-m", WHISPER_MODEL, "-l", "en", "-t", "4", "-f", filename],
+                [WHISPER_CLI, "-m", WHISPER_MODEL, "-l", LANGUAGE, "-t", "4", "-f", filename],
                 capture_output=True, text=True, timeout=30
             )
             if result.returncode != 0:
@@ -687,7 +679,7 @@ class BotGUI:
         # NOTE: rpicam-still is a Raspberry Pi-specific tool (libcamera stack).
         # On other systems this will fail gracefully and return None.
         # Future phase: add generic webcam support (e.g. via OpenCV or fswebcam).
-        self.set_state(BotStates.CAPTURING, "Watching...")
+        self.set_state(BotStates.CAPTURING, "Viendo...")
         rpicam = "rpicam-still"
         if not any(
             os.path.exists(os.path.join(d, rpicam))
@@ -721,17 +713,18 @@ class BotGUI:
     # =========================================================================
 
     def chat_and_respond(self, text, img_path=None):
-        if "forget everything" in text.lower() or "reset memory" in text.lower():
+        _lower = text.lower()
+        if any(t in _lower for t in ("olvida todo", "borrar memoria", "forget everything", "reset memory")):
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
             self.save_chat_history()
-            with self.tts_queue_lock: 
-                self.tts_queue.append("Okay. Memory wiped.")
-            self.set_state(BotStates.IDLE, "Memory Wiped")
+            with self.tts_queue_lock:
+                self.tts_queue.append("De acuerdo. Memoria borrada.")
+            self.set_state(BotStates.IDLE, "Memoria borrada")
             return
 
         model_to_use = VISION_MODEL if img_path else TEXT_MODEL
-        self.set_state(BotStates.THINKING, "Thinking...", cam_path=img_path)
+        self.set_state(BotStates.THINKING, "Pensando...", cam_path=img_path)
         
         messages = []
         if img_path:
@@ -765,15 +758,15 @@ class BotGUI:
 
                 self.thinking_sound_active.clear()
                 if self.current_state != BotStates.SPEAKING:
-                    self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                    self.append_to_text("BOT: ", newline=False)
+                    self.set_state(BotStates.SPEAKING, "Hablando...", cam_path=img_path)
+                    self.append_to_text("A.X.I.S.: ", newline=False)
 
                 self._stream_to_text(content)
                 
                 sentence_buffer += content
                 if any(punct in content for punct in ".!?\n"):
                     clean_sentence = sentence_buffer.strip()
-                    if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
+                    if clean_sentence and re.search(r'\w', clean_sentence):
                         with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
                     sentence_buffer = ""
 
@@ -785,74 +778,74 @@ class BotGUI:
                     if tool_result and tool_result.startswith("CHAT_FALLBACK::"):
                         chat_text = tool_result.split("::", 1)[1]
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
+                        self.set_state(BotStates.SPEAKING, "Hablando...", cam_path=img_path)
+                        self.append_to_text("A.X.I.S.: ", newline=False)
                         self.append_to_text(chat_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(chat_text)
                         self.session_memory.append({"role": "assistant", "content": chat_text})
                         self.wait_for_tts()
-                        self.set_state(BotStates.IDLE, "Ready")
+                        self.set_state(BotStates.IDLE, "Listo")
                         return
 
                     if tool_result == "IMAGE_CAPTURE_TRIGGERED":
                         new_img_path = self.capture_image()
                         if new_img_path:
                             self.chat_and_respond(text, img_path=new_img_path)
-                            return 
+                            return
 
                     elif tool_result == "INVALID_ACTION":
-                        fallback_text = "I am not sure how to do that."
+                        fallback_text = "No sé cómo hacer eso."
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
+                        self.set_state(BotStates.SPEAKING, "Hablando...", cam_path=img_path)
+                        self.append_to_text("A.X.I.S.: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(fallback_text)
 
                     elif tool_result == "SEARCH_EMPTY":
-                        fallback_text = "I searched, but I couldn't find any news about that."
+                        fallback_text = "Busqué pero no encontré resultados sobre eso."
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
+                        self.set_state(BotStates.SPEAKING, "Hablando...", cam_path=img_path)
+                        self.append_to_text("A.X.I.S.: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(fallback_text)
 
                     elif tool_result == "SEARCH_ERROR":
-                        fallback_text = "I cannot reach the internet right now."
+                        fallback_text = "Ahora mismo no puedo acceder a internet."
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
+                        self.set_state(BotStates.SPEAKING, "Hablando...", cam_path=img_path)
+                        self.append_to_text("A.X.I.S.: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(fallback_text)
 
                     elif tool_result:
                         summary_prompt = [
-                            {"role": "system", "content": "Summarize this result in one short sentence."},
-                            {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
+                            {"role": "system", "content": "Resume este resultado en una frase corta en español."},
+                            {"role": "user", "content": f"RESULTADO: {tool_result}\nPregunta: {text}"}
                         ]
-                        
-                        self.set_state(BotStates.THINKING, "Reading...")
+
+                        self.set_state(BotStates.THINKING, "Leyendo...")
                         self.thinking_sound_active.set()
-                        
+
                         final_resp = ollama.chat(model=model_to_use, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
                         final_text = final_resp['message']['content']
-                        
+
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        
-                        self.append_to_text("BOT: ", newline=False)
+                        self.set_state(BotStates.SPEAKING, "Hablando...", cam_path=img_path)
+
+                        self.append_to_text("A.X.I.S.: ", newline=False)
                         self.append_to_text(final_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(final_text)
                         self.session_memory.append({"role": "assistant", "content": final_text})
             else:
                 self.append_to_text("")
-                self.session_memory.append({"role": "assistant", "content": full_response_buffer}) 
-            
+                self.session_memory.append({"role": "assistant", "content": full_response_buffer})
+
             self.wait_for_tts()
-            self.set_state(BotStates.IDLE, "Ready")
-                
+            self.set_state(BotStates.IDLE, "Listo")
+
         except Exception as e:
-            print(f"LLM Error: {e}")
-            self.set_state(BotStates.ERROR, "Brain Freeze!")
+            print(f"[LLM] Error: {e}", flush=True)
+            self.set_state(BotStates.ERROR, "¡Error de procesamiento!")
 
     def wait_for_tts(self):
         while self.tts_queue or self.tts_active.is_set():
@@ -872,7 +865,9 @@ class BotGUI:
             else: time.sleep(0.05)
 
     def speak(self, text):
-        clean = re.sub(r"[^\w\s,.!?:-]", "", text)
+        # Keep Unicode word chars (\w covers ñ, á, é, í, ó, ú, ü, Ñ etc. in Python 3),
+        # whitespace, standard punctuation, and Spanish-specific ¡¿
+        clean = re.sub(r"[^\w\s,.!?¡¿:;'\-]", "", text, flags=re.UNICODE)
         if not clean.strip(): return
 
         if not os.path.exists(PIPER_BIN):
@@ -1006,40 +1001,42 @@ class BotGUI:
             json.dump([full[0]] + conv, f, indent=4)
 
 def check_required_binaries():
-    """Verify critical binaries exist before starting the GUI. Prints clear errors."""
+    """Verifica binarios críticos antes de iniciar la GUI."""
     required = [
-        (WHISPER_CLI,   "whisper-cli",    "Run setup.sh to build whisper.cpp"),
-        (WHISPER_MODEL, "whisper model",  "Run setup.sh to download the model"),
-        (PIPER_BIN,     "piper TTS",      "Run setup.sh to download piper"),
+        (WHISPER_CLI,   "whisper-cli",         "Ejecuta setup.sh para compilar whisper.cpp"),
+        (WHISPER_MODEL, "whisper model",        "Ejecuta setup.sh para descargar el modelo"),
+        (PIPER_BIN,     "piper TTS",            "Ejecuta setup.sh para descargar piper"),
     ]
     missing = []
     for path, label, hint in required:
         if os.path.exists(path):
             print(f"[OK] {label}: {path}", flush=True)
         else:
-            print(f"[MISSING] {label}: {path}", flush=True)
+            print(f"[FALTA] {label}: {path}", flush=True)
             print(f"  → {hint}", flush=True)
             missing.append(label)
 
-    voice_model = CURRENT_CONFIG.get("voice_model", _p("piper", "en_GB-semaine-medium.onnx"))
+    voice_model = CURRENT_CONFIG.get("voice_model", _p("piper", "es_ES-davefx-medium.onnx"))
     if not os.path.isabs(voice_model):
         voice_model = _p(voice_model)
     if os.path.exists(voice_model):
         print(f"[OK] voice model: {voice_model}", flush=True)
     else:
-        print(f"[MISSING] voice model: {voice_model}", flush=True)
-        print("  → Run setup.sh to download the piper voice model", flush=True)
+        print(f"[FALTA] voice model: {voice_model}", flush=True)
+        print("  → Ejecuta setup.sh para descargar el modelo de voz Piper", flush=True)
         missing.append("voice model")
 
     if missing:
-        print(f"\n[WARNING] {len(missing)} component(s) missing: {', '.join(missing)}", flush=True)
-        print("[WARNING] Voice pipeline will not work until these are installed.", flush=True)
+        print(f"\n[AVISO] {len(missing)} componente(s) faltante(s): {', '.join(missing)}", flush=True)
+        print("[AVISO] El flujo de voz no funcionará hasta que estén instalados.", flush=True)
     return missing
 
 
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING ---", flush=True)
-    print(f"[INIT] Project root: {PROJECT_ROOT}", flush=True)
+    print("--- A.X.I.S. INICIANDO ---", flush=True)
+    print(f"[INIT] Raíz del proyecto: {PROJECT_ROOT}", flush=True)
+    print(f"[INIT] Idioma: {LANGUAGE} | Región búsqueda: {SEARCH_REGION}", flush=True)
+    print(f"[INIT] Modelo Whisper: {WHISPER_MODEL}", flush=True)
     check_required_binaries()
     root = tk.Tk()
     app = BotGUI(root)
