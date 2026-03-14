@@ -4,51 +4,126 @@
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo -e "${GREEN}🤖 Pi Local Assistant Setup Script${NC}"
+# Always run from the project root (directory of this script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# 1. Install System Dependencies (The "Hidden" Requirements)
-echo -e "${YELLOW}[1/6] Installing System Tools (apt)...${NC}"
-sudo apt update
-sudo apt install -y python3-tk libasound2-dev libportaudio2 libatlas-base-dev cmake build-essential espeak-ng git
+echo -e "${GREEN}🤖 A.X.I.S. Local Agent Setup Script${NC}"
+echo -e "${YELLOW}Platform: $(uname -s) | Architecture: $(uname -m)${NC}"
 
-# 2. Create Folders
-echo -e "${YELLOW}[2/6] Creating Folders...${NC}"
-mkdir -p piper
-mkdir -p sounds/greeting_sounds
-mkdir -p sounds/thinking_sounds
-mkdir -p sounds/ack_sounds
-mkdir -p sounds/error_sounds
-mkdir -p faces/idle
-mkdir -p faces/listening
-mkdir -p faces/thinking
-mkdir -p faces/speaking
-mkdir -p faces/error
-mkdir -p faces/warmup
+# --- OS Detection ---
+detect_os() {
+    if [ -f /etc/arch-release ] || command -v pacman &>/dev/null; then
+        echo "arch"
+    elif command -v apt &>/dev/null; then
+        echo "debian"
+    else
+        echo "unknown"
+    fi
+}
 
-# 3. Download Piper (Architecture Check)
-echo -e "${YELLOW}[3/6] Setting up Piper TTS...${NC}"
+OS_TYPE=$(detect_os)
 ARCH=$(uname -m)
-if [ "$ARCH" == "aarch64" ]; then
-    # FIXED: Using the specific 2023.11.14-2 release known to work on Pi
-    wget -O piper.tar.gz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_aarch64.tar.gz
-    tar -xvf piper.tar.gz -C piper --strip-components=1
-    rm piper.tar.gz
+echo -e "${YELLOW}Detected OS type: ${OS_TYPE}${NC}"
+
+# 1. Install System Dependencies
+echo -e "${YELLOW}[1/7] Installing system dependencies...${NC}"
+if [ "$OS_TYPE" == "arch" ]; then
+    echo "  Using pacman (Arch Linux)..."
+    sudo pacman -S --needed --noconfirm \
+        python tk python-pip \
+        alsa-utils portaudio \
+        cmake base-devel \
+        espeak-ng git wget curl
+elif [ "$OS_TYPE" == "debian" ]; then
+    echo "  Using apt (Debian/Ubuntu)..."
+    sudo apt update
+    sudo apt install -y \
+        python3-tk libasound2-dev libportaudio2 \
+        libatlas-base-dev cmake build-essential \
+        espeak-ng git wget curl
 else
-    echo -e "${RED}⚠️  Not on Raspberry Pi (aarch64). Skipping Piper download.${NC}"
+    echo -e "${RED}⚠️  Unknown OS. Install manually: cmake git python3 portaudio alsa-utils espeak-ng${NC}"
 fi
 
-# 4. Download Voice Model
-echo -e "${YELLOW}[4/6] Downloading Voice Model...${NC}"
-cd piper
-wget -nc -O en_GB-semaine-medium.onnx https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/semaine/medium/en_GB-semaine-medium.onnx
-wget -nc -O en_GB-semaine-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/semaine/medium/en_GB-semaine-medium.onnx.json
-cd ..
+# 2. Create Project Folders
+echo -e "${YELLOW}[2/7] Creating project folders...${NC}"
+mkdir -p piper
+mkdir -p sounds/greeting_sounds sounds/thinking_sounds sounds/ack_sounds sounds/error_sounds
+mkdir -p faces/idle faces/listening faces/thinking faces/speaking faces/error faces/capturing faces/warmup
 
-# 5. Install Python Libraries
-echo -e "${YELLOW}[5/6] Installing Python Libraries...${NC}"
-# Check if venv exists, if not create it
+# 3. Download Piper TTS Binary (supports aarch64 and x86_64)
+echo -e "${YELLOW}[3/7] Setting up Piper TTS binary...${NC}"
+if [ ! -f "piper/piper" ]; then
+    PIPER_URL=""
+    if [ "$ARCH" == "aarch64" ]; then
+        PIPER_URL="https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_aarch64.tar.gz"
+    elif [ "$ARCH" == "x86_64" ]; then
+        PIPER_URL="https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz"
+    else
+        echo -e "${RED}⚠️  Unsupported architecture: $ARCH. Skipping Piper binary download.${NC}"
+    fi
+
+    if [ -n "$PIPER_URL" ]; then
+        echo "  Downloading Piper for $ARCH..."
+        wget -O /tmp/piper.tar.gz "$PIPER_URL"
+        tar -xf /tmp/piper.tar.gz -C piper --strip-components=1
+        rm /tmp/piper.tar.gz
+        chmod +x piper/piper 2>/dev/null || true
+        echo -e "${GREEN}  Piper installed at piper/piper${NC}"
+    fi
+else
+    echo -e "${GREEN}  Piper binary already present.${NC}"
+fi
+
+# 4. Download Piper Voice Model
+echo -e "${YELLOW}[4/7] Downloading voice model...${NC}"
+if [ ! -f "piper/en_GB-semaine-medium.onnx" ]; then
+    wget -O piper/en_GB-semaine-medium.onnx \
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/semaine/medium/en_GB-semaine-medium.onnx"
+    wget -O piper/en_GB-semaine-medium.onnx.json \
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/semaine/medium/en_GB-semaine-medium.onnx.json"
+    echo -e "${GREEN}  Voice model downloaded.${NC}"
+else
+    echo -e "${GREEN}  Voice model already present.${NC}"
+fi
+
+# 5. Build whisper.cpp (STT engine)
+echo -e "${YELLOW}[5/7] Building whisper.cpp (speech-to-text)...${NC}"
+if [ ! -f "whisper.cpp/build/bin/whisper-cli" ]; then
+    if [ ! -d "whisper.cpp" ]; then
+        echo "  Cloning whisper.cpp..."
+        git clone https://github.com/ggerganov/whisper.cpp whisper.cpp
+    fi
+
+    echo "  Building whisper.cpp (this may take a few minutes)..."
+    cmake -B whisper.cpp/build -S whisper.cpp
+    cmake --build whisper.cpp/build --config Release -j"$(nproc)"
+
+    if [ -f "whisper.cpp/build/bin/whisper-cli" ]; then
+        echo -e "${GREEN}  whisper-cli built successfully.${NC}"
+    else
+        echo -e "${RED}❌ whisper-cli build FAILED. Check cmake output above.${NC}"
+    fi
+else
+    echo -e "${GREEN}  whisper-cli already built.${NC}"
+fi
+
+# Download Whisper model (base.en)
+echo -e "${YELLOW}  Downloading Whisper model (ggml-base.en)...${NC}"
+if [ ! -f "whisper.cpp/models/ggml-base.en.bin" ]; then
+    mkdir -p whisper.cpp/models
+    wget -O whisper.cpp/models/ggml-base.en.bin \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+    echo -e "${GREEN}  Whisper model downloaded.${NC}"
+else
+    echo -e "${GREEN}  Whisper model already present.${NC}"
+fi
+
+# 6. Python Virtual Environment + Dependencies
+echo -e "${YELLOW}[6/7] Installing Python libraries...${NC}"
 if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
@@ -56,19 +131,44 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 6. Pull AI Models
-echo -e "${YELLOW}[6/6] Checking AI Models...${NC}"
-if command -v ollama &> /dev/null; then
+# 7. Ollama AI Models + Wake Word
+echo -e "${YELLOW}[7/7] Checking AI models (Ollama)...${NC}"
+if command -v ollama &>/dev/null; then
     ollama pull gemma3:1b
     ollama pull moondream
 else
-    echo -e "${RED}❌ Ollama not found. Please install it manually.${NC}"
+    echo -e "${RED}❌ Ollama not found. Install from: https://ollama.com${NC}"
 fi
 
-# 7. OpenWakeWord Model (Added this back so the user has a default)
 if [ ! -f "wakeword.onnx" ]; then
-    echo -e "${YELLOW}Downloading default 'Hey Jarvis' wake word...${NC}"
-    curl -L -o wakeword.onnx https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx
+    echo "  Downloading default 'Hey Jarvis' wake word model..."
+    curl -L -o wakeword.onnx \
+        "https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx"
 fi
 
-echo -e "${GREEN}✨ Setup Complete! Run 'source venv/bin/activate' then 'python agent.py'${NC}"
+# --- Final Verification ---
+echo ""
+echo -e "${YELLOW}--- Verification ---${NC}"
+ERRORS=0
+
+check_file() {
+    if [ -f "$1" ]; then
+        echo -e "${GREEN}  ✓ $2${NC}"
+    else
+        echo -e "${RED}  ✗ MISSING: $2 ($1)${NC}"
+        ERRORS=$((ERRORS + 1))
+    fi
+}
+
+check_file "whisper.cpp/build/bin/whisper-cli"    "whisper-cli binary"
+check_file "whisper.cpp/models/ggml-base.en.bin"  "whisper model"
+check_file "piper/piper"                           "piper TTS binary"
+check_file "piper/en_GB-semaine-medium.onnx"       "piper voice model"
+check_file "wakeword.onnx"                         "wake word model"
+
+echo ""
+if [ $ERRORS -eq 0 ]; then
+    echo -e "${GREEN}✨ Setup complete! Run: source venv/bin/activate && python agent.py${NC}"
+else
+    echo -e "${RED}⚠️  Setup completed with ${ERRORS} missing component(s). See above.${NC}"
+fi
