@@ -1,6 +1,6 @@
 # =========================================================================
-#  Be More Agent 🤖
-#  A Local, Offline-First AI Agent for Raspberry Pi
+#  A.X.I.S. Local Agent
+#  A Local, Offline-First AI Agent
 #
 #  Copyright (c) 2026 brenpoly
 #  Licensed under the MIT License
@@ -28,10 +28,20 @@ import atexit
 import datetime
 import warnings
 import wave
-import struct 
+import struct
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
+
+# =========================================================================
+# PROJECT ROOT — all paths are resolved relative to this file's location
+# so the agent works regardless of the working directory at launch.
+# =========================================================================
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+def _p(*parts):
+    """Return an absolute path inside the project root."""
+    return os.path.join(PROJECT_ROOT, *parts)
 
 # Core dependencies
 import sounddevice as sd
@@ -50,19 +60,24 @@ from ddgs import DDGS
 # 1. CONFIGURATION & CONSTANTS
 # =========================================================================
 
-CONFIG_FILE = "config.json"
-MEMORY_FILE = "memory.json"
-BMO_IMAGE_FILE = "current_image.jpg"
-WAKE_WORD_MODEL = "./wakeword.onnx"
+CONFIG_FILE      = _p("config.json")
+MEMORY_FILE      = _p("memory.json")
+BMO_IMAGE_FILE   = _p("current_image.jpg")
+WAKE_WORD_MODEL  = _p("wakeword.onnx")
 WAKE_WORD_THRESHOLD = 0.5
 
+# Binaries — resolved at project root so the agent can be launched from anywhere
+WHISPER_CLI  = _p("whisper.cpp", "build", "bin", "whisper-cli")
+WHISPER_MODEL = _p("whisper.cpp", "models", "ggml-base.en.bin")
+PIPER_BIN    = _p("piper", "piper")
+
 # HARDWARE SETTINGS
-INPUT_DEVICE_NAME = None 
+INPUT_DEVICE_NAME = None
 
 DEFAULT_CONFIG = {
     "text_model": "gemma3:1b",
     "vision_model": "moondream",
-    "voice_model": "piper/en_GB-semaine-medium.onnx",
+    "voice_model": _p("piper", "en_GB-semaine-medium.onnx"),
     "chat_memory": True,
     "camera_rotation": 0,
     "system_prompt_extras": ""
@@ -102,7 +117,8 @@ class BotStates:
     WARMUP = "warmup"       
 
 # --- SYSTEM PROMPT ---
-BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry Pi.
+# NOTE: kept in English for this phase. Spanish migration is planned for the next phase.
+BASE_SYSTEM_PROMPT = """You are a helpful robot assistant.
 Personality: Cute, helpful, robot.
 Style: Short sentences. Enthusiastic.
 
@@ -129,11 +145,11 @@ You: {"action": "capture_image", "value": "environment"}
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
 
-# Sound Directories
-greeting_sounds_dir = "sounds/greeting_sounds"
-ack_sounds_dir = "sounds/ack_sounds"
-thinking_sounds_dir = "sounds/thinking_sounds"
-error_sounds_dir = "sounds/error_sounds"
+# Sound Directories (absolute paths)
+greeting_sounds_dir = _p("sounds", "greeting_sounds")
+ack_sounds_dir      = _p("sounds", "ack_sounds")
+thinking_sounds_dir = _p("sounds", "thinking_sounds")
+error_sounds_dir    = _p("sounds", "error_sounds")
 
 # =========================================================================
 # 2. GUI CLASS
@@ -289,8 +305,8 @@ class BotGUI:
             self.set_state(BotStates.IDLE, "Interrupted.")
 
     def load_animations(self):
-        base_path = "faces"
-        states = ["idle", "listening", "thinking", "speaking", "error", "capturing", "warmup"] 
+        base_path = _p("faces")
+        states = ["idle", "listening", "thinking", "speaking", "error", "capturing", "warmup"]
         for state in states:
             folder = os.path.join(base_path, state)
             self.animations[state] = []
@@ -506,8 +522,10 @@ class BotGUI:
         try:
             device_info = sd.query_devices(kind='input')
             native_rate = int(device_info['default_samplerate'])
-        except: native_rate = 48000
-            
+        except Exception as e:
+            print(f"[AUDIO] Could not query input device rate: {e}", flush=True)
+            native_rate = 48000
+
         use_resampling = (native_rate != OWW_SAMPLE_RATE)
         input_rate = native_rate if use_resampling else OWW_SAMPLE_RATE
         input_chunk_size = int(CHUNK_SIZE * (input_rate / OWW_SAMPLE_RATE)) if use_resampling else CHUNK_SIZE
@@ -547,7 +565,9 @@ class BotGUI:
         try:
             device_info = sd.query_devices(kind='input')
             samplerate = int(device_info['default_samplerate'])
-        except: samplerate = 44100 
+        except Exception as e:
+            print(f"[AUDIO] Could not query input device rate: {e}", flush=True)
+            samplerate = 44100
 
         silence_threshold = 0.006
         silence_duration = 1.5
@@ -574,11 +594,13 @@ class BotGUI:
             else: silent_chunks = 0
 
         try:
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, 
-                                device=INPUT_DEVICE_NAME, blocksize=chunk_size): 
+            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                                device=INPUT_DEVICE_NAME, blocksize=chunk_size):
                 while not silence_started and recorded_chunks < max_chunks:
                     sd.sleep(int(chunk_duration * 1000))
-        except Exception as e: return None 
+        except Exception as e:
+            print(f"[AUDIO] Recording error (adaptive): {e}", flush=True)
+            return None
         
         return self.save_audio_buffer(buffer, filename, samplerate)
 
@@ -588,15 +610,19 @@ class BotGUI:
         try:
             device_info = sd.query_devices(kind='input')
             samplerate = int(device_info['default_samplerate'])
-        except: samplerate = 44100 
+        except Exception as e:
+            print(f"[AUDIO] Could not query input device rate: {e}", flush=True)
+            samplerate = 44100
 
         buffer = []
         def callback(indata, frames, time_info, status): buffer.append(indata.copy())
-        
+
         try:
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
                 while self.recording_active.is_set(): sd.sleep(50)
-        except Exception as e: return None
+        except Exception as e:
+            print(f"[AUDIO] Recording error (PTT): {e}", flush=True)
+            return None
             
         return self.save_audio_buffer(buffer, filename, samplerate)
 
@@ -615,35 +641,75 @@ class BotGUI:
 
     def transcribe_audio(self, filename):
         print("Transcribing...", flush=True)
+        if not os.path.exists(WHISPER_CLI):
+            print(f"[ERROR] whisper-cli not found: {WHISPER_CLI}", flush=True)
+            print("[ERROR] Run setup.sh to build whisper.cpp", flush=True)
+            return ""
+        if not os.path.exists(WHISPER_MODEL):
+            print(f"[ERROR] Whisper model not found: {WHISPER_MODEL}", flush=True)
+            return ""
         try:
             result = subprocess.run(
-                ["./whisper.cpp/build/bin/whisper-cli", "-m", "./whisper.cpp/models/ggml-base.en.bin", "-l", "en", "-t", "4", "-f", filename],
-                capture_output=True, text=True
+                [WHISPER_CLI, "-m", WHISPER_MODEL, "-l", "en", "-t", "4", "-f", filename],
+                capture_output=True, text=True, timeout=30
             )
+            if result.returncode != 0:
+                print(f"[ERROR] whisper-cli exited with code {result.returncode}", flush=True)
+                print(f"[ERROR] stderr: {result.stderr.strip()}", flush=True)
+                return ""
             transcription_lines = result.stdout.strip().split('\n')
             if transcription_lines and transcription_lines[-1].strip():
                 last_line = transcription_lines[-1].strip()
-                if ']' in last_line: transcription = last_line.split("]")[1].strip()
-                else: transcription = last_line
-            else: transcription = ""
+                if ']' in last_line:
+                    transcription = last_line.split("]")[1].strip()
+                else:
+                    transcription = last_line
+            else:
+                transcription = ""
             print(f"Heard: '{transcription}'", flush=True)
             return transcription.strip()
+        except subprocess.TimeoutExpired:
+            print("[ERROR] whisper-cli timed out after 30 seconds", flush=True)
+            return ""
+        except FileNotFoundError:
+            print(f"[ERROR] whisper-cli binary not found at: {WHISPER_CLI}", flush=True)
+            return ""
         except Exception as e:
-            print(f"Transcription Error: {e}")
+            print(f"[ERROR] Transcription failed: {e}", flush=True)
+            traceback.print_exc()
             return ""
 
     def capture_image(self):
+        # NOTE: rpicam-still is a Raspberry Pi-specific tool (libcamera stack).
+        # On other systems this will fail gracefully and return None.
+        # Future phase: add generic webcam support (e.g. via OpenCV or fswebcam).
         self.set_state(BotStates.CAPTURING, "Watching...")
+        rpicam = "rpicam-still"
+        if not any(
+            os.path.exists(os.path.join(d, rpicam))
+            for d in os.environ.get("PATH", "").split(":")
+        ):
+            print("[CAMERA] rpicam-still not found — camera capture requires a Raspberry Pi.", flush=True)
+            return None
         try:
-            subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", BMO_IMAGE_FILE], check=True)
+            subprocess.run(
+                [rpicam, "-t", "500", "-n", "--width", "640", "--height", "480", "-o", BMO_IMAGE_FILE],
+                check=True, timeout=10
+            )
             rotation = CURRENT_CONFIG.get("camera_rotation", 0)
             if rotation != 0:
                 img = Image.open(BMO_IMAGE_FILE)
-                img = img.rotate(rotation, expand=True) 
+                img = img.rotate(rotation, expand=True)
                 img.save(BMO_IMAGE_FILE)
             return BMO_IMAGE_FILE
+        except FileNotFoundError:
+            print("[CAMERA] rpicam-still not found — camera capture requires a Raspberry Pi.", flush=True)
+            return None
+        except subprocess.CalledProcessError as e:
+            print(f"[CAMERA] rpicam-still failed (exit {e.returncode})", flush=True)
+            return None
         except Exception as e:
-            print(f"Camera Error: {e}")
+            print(f"[CAMERA] Unexpected camera error: {e}", flush=True)
             return None
 
     # =========================================================================
@@ -804,13 +870,21 @@ class BotGUI:
     def speak(self, text):
         clean = re.sub(r"[^\w\s,.!?:-]", "", text)
         if not clean.strip(): return
-        
+
+        if not os.path.exists(PIPER_BIN):
+            print(f"[ERROR] piper binary not found: {PIPER_BIN}", flush=True)
+            print("[ERROR] Run setup.sh to download piper", flush=True)
+            return
+
         print(f"[PIPER SPEAKING] '{clean}'", flush=True)
-        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
-        
+        voice_model = CURRENT_CONFIG.get("voice_model", _p("piper", "en_GB-semaine-medium.onnx"))
+        # Resolve voice model to absolute path if it isn't already
+        if not os.path.isabs(voice_model):
+            voice_model = _p(voice_model)
+
         try:
             self.current_audio_process = subprocess.Popen(
-                ["./piper/piper", "--model", voice_model, "--output-raw"], 
+                [PIPER_BIN, "--model", voice_model, "--output-raw"],
                 stdin=subprocess.PIPE, 
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL
@@ -916,8 +990,42 @@ class BotGUI:
         with open(MEMORY_FILE, "w") as f: 
             json.dump([full[0]] + conv, f, indent=4)
 
+def check_required_binaries():
+    """Verify critical binaries exist before starting the GUI. Prints clear errors."""
+    required = [
+        (WHISPER_CLI,   "whisper-cli",    "Run setup.sh to build whisper.cpp"),
+        (WHISPER_MODEL, "whisper model",  "Run setup.sh to download the model"),
+        (PIPER_BIN,     "piper TTS",      "Run setup.sh to download piper"),
+    ]
+    missing = []
+    for path, label, hint in required:
+        if os.path.exists(path):
+            print(f"[OK] {label}: {path}", flush=True)
+        else:
+            print(f"[MISSING] {label}: {path}", flush=True)
+            print(f"  → {hint}", flush=True)
+            missing.append(label)
+
+    voice_model = CURRENT_CONFIG.get("voice_model", _p("piper", "en_GB-semaine-medium.onnx"))
+    if not os.path.isabs(voice_model):
+        voice_model = _p(voice_model)
+    if os.path.exists(voice_model):
+        print(f"[OK] voice model: {voice_model}", flush=True)
+    else:
+        print(f"[MISSING] voice model: {voice_model}", flush=True)
+        print("  → Run setup.sh to download the piper voice model", flush=True)
+        missing.append("voice model")
+
+    if missing:
+        print(f"\n[WARNING] {len(missing)} component(s) missing: {', '.join(missing)}", flush=True)
+        print("[WARNING] Voice pipeline will not work until these are installed.", flush=True)
+    return missing
+
+
 if __name__ == "__main__":
     print("--- SYSTEM STARTING ---", flush=True)
+    print(f"[INIT] Project root: {PROJECT_ROOT}", flush=True)
+    check_required_binaries()
     root = tk.Tk()
     app = BotGUI(root)
     root.mainloop()
