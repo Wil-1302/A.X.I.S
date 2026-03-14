@@ -67,10 +67,20 @@ INPUT_DEVICE_NAME = None
 DEFAULT_CONFIG = {
     "text_model": "gemma3:1b",
     "language": "es",
-    "whisper_model": "ggml-base.bin",
+    # Recommended for Spanish: ggml-small.bin (much better accuracy, ~244MB)
+    # Minimum viable: ggml-base.bin (~74MB, less accurate)
+    "whisper_model": "ggml-small.bin",
+    "whisper_threads": 4,
     "voice_model": _p("piper", "es_ES-davefx-medium.onnx"),
     "chat_memory": True,
-    "system_prompt_extras": ""
+    "system_prompt_extras": "",
+    # Audio tuning
+    "silence_threshold": 0.010,   # RMS threshold (0.0–1.0) — raise if cuts off too early
+    "silence_duration": 2.0,      # seconds of silence before stopping
+    "min_speech_duration": 0.5,   # seconds of speech required before silence detection activates
+    "max_record_time": 30.0,
+    # Debug: save last recording to last_recording.wav for manual inspection
+    "debug_audio": True,
 }
 
 OLLAMA_OPTIONS = {
@@ -92,10 +102,21 @@ def load_config():
     return config
 
 CURRENT_CONFIG = load_config()
-TEXT_MODEL   = CURRENT_CONFIG["text_model"]
-LANGUAGE     = CURRENT_CONFIG.get("language", "es")
-WHISPER_MODEL = _p("whisper.cpp", "models", CURRENT_CONFIG.get("whisper_model", "ggml-base.bin"))
+TEXT_MODEL    = CURRENT_CONFIG["text_model"]
+LANGUAGE      = CURRENT_CONFIG.get("language", "es")
+WHISPER_MODEL = _p("whisper.cpp", "models", CURRENT_CONFIG.get("whisper_model", "ggml-small.bin"))
 SEARCH_REGION = "es-es" if LANGUAGE == "es" else "us-en"
+
+# Audio tuning — read once from config
+SILENCE_THRESHOLD    = float(CURRENT_CONFIG.get("silence_threshold", 0.010))
+SILENCE_DURATION     = float(CURRENT_CONFIG.get("silence_duration", 2.0))
+MIN_SPEECH_DURATION  = float(CURRENT_CONFIG.get("min_speech_duration", 0.5))
+MAX_RECORD_TIME      = float(CURRENT_CONFIG.get("max_record_time", 30.0))
+WHISPER_THREADS      = int(CURRENT_CONFIG.get("whisper_threads", 4))
+DEBUG_AUDIO          = bool(CURRENT_CONFIG.get("debug_audio", True))
+
+# Fixed target rate for Whisper (it internally works at 16 kHz)
+WHISPER_SAMPLE_RATE = 16000
 
 # --- SYSTEM PROMPT ---
 # NOTE: capture_image is intentionally excluded from available tools in this
@@ -433,65 +454,91 @@ class AxisTerminal:
 
     def record_voice_adaptive(self, filename="input.wav"):
         self.set_state(BotStates.LISTENING, "Grabando (detección de silencio)...")
-        time.sleep(0.5)
+        time.sleep(0.3)  # brief gap after state change sound
+
         try:
             samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
         except Exception:
             samplerate = 44100
 
-        silence_threshold = 0.006
-        silence_duration  = 1.5
-        max_record_time   = 30.0
-        chunk_duration    = 0.05
+        chunk_duration    = 0.05  # 50 ms chunks
         chunk_size        = int(samplerate * chunk_duration)
-        num_silent_chunks = int(silence_duration / chunk_duration)
-        max_chunks        = int(max_record_time / chunk_duration)
+        num_silent_chunks = int(SILENCE_DURATION / chunk_duration)
+        max_chunks        = int(MAX_RECORD_TIME / chunk_duration)
+        # Minimum speech chunks before silence detection activates
+        min_speech_chunks = int(MIN_SPEECH_DURATION / chunk_duration)
 
-        buffer          = []
-        silent_chunks   = 0
-        recorded_chunks = 0
-        silence_started = False
+        print(f"  {C.GRAY}[MIC] Tasa: {samplerate} Hz | "
+              f"Umbral silencio: {SILENCE_THRESHOLD:.3f} | "
+              f"Silencio tras: {SILENCE_DURATION:.1f}s | "
+              f"Mín. habla: {MIN_SPEECH_DURATION:.1f}s{C.RESET}", flush=True)
+        print(f"  {C.GREEN}[MIC] Grabando... (habla ahora){C.RESET}", flush=True)
+
+        buffer           = []
+        silent_chunks    = 0
+        recorded_chunks  = 0
+        speech_chunks    = 0   # chunks above threshold
+        silence_started  = False
+        record_start     = time.time()
 
         def callback(indata, frames, time_info, status):
-            nonlocal silent_chunks, recorded_chunks, silence_started
-            volume_norm = np.linalg.norm(indata) / np.sqrt(len(indata))
+            nonlocal silent_chunks, recorded_chunks, speech_chunks, silence_started
+            if status:
+                print(f"  {C.GRAY}[MIC] {status}{C.RESET}", flush=True)
+            volume_rms = np.linalg.norm(indata) / np.sqrt(len(indata))
             buffer.append(indata.copy())
             recorded_chunks += 1
-            if recorded_chunks < 5:
-                return
-            if volume_norm < silence_threshold:
-                silent_chunks += 1
-                if silent_chunks >= num_silent_chunks:
-                    silence_started = True
+
+            if volume_rms >= SILENCE_THRESHOLD:
+                speech_chunks += 1
+                silent_chunks  = 0
             else:
-                silent_chunks = 0
+                # Only start counting silence once minimum speech is detected
+                if speech_chunks >= min_speech_chunks:
+                    silent_chunks += 1
+                    if silent_chunks >= num_silent_chunks:
+                        silence_started = True
 
         try:
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
-                                 device=INPUT_DEVICE_NAME, blocksize=chunk_size):
+            with sd.InputStream(samplerate=samplerate, channels=1, dtype='float32',
+                                 callback=callback, device=INPUT_DEVICE_NAME,
+                                 blocksize=chunk_size):
                 while not silence_started and recorded_chunks < max_chunks:
                     sd.sleep(int(chunk_duration * 1000))
         except Exception as e:
             print(f"  {C.RED}[AUDIO] Error de grabación: {e}{C.RESET}", flush=True)
             return None
 
+        duration = time.time() - record_start
+        print(f"  {C.GRAY}[MIC] Grabación terminada — {duration:.2f}s "
+              f"({speech_chunks} chunks de habla detectados){C.RESET}", flush=True)
+
+        if speech_chunks < min_speech_chunks:
+            print(f"  {C.YELLOW}[MIC] Habla insuficiente detectada — ignorando.{C.RESET}", flush=True)
+            return None
+
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename="input.wav"):
         self.set_state(BotStates.LISTENING, "Grabando (PTT — Enter para detener)...")
-        time.sleep(0.5)
+        time.sleep(0.3)
+
         try:
             samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
         except Exception:
             samplerate = 44100
 
-        buffer = []
+        print(f"  {C.GRAY}[MIC] Tasa: {samplerate} Hz{C.RESET}", flush=True)
+        print(f"  {C.GREEN}[MIC] Grabando... (presiona Enter para detener){C.RESET}", flush=True)
+
+        buffer     = []
+        stop_event = threading.Event()
+        record_start = time.time()
 
         def callback(indata, frames, time_info, status):
+            if status:
+                print(f"  {C.GRAY}[MIC] {status}{C.RESET}", flush=True)
             buffer.append(indata.copy())
-
-        # Start recording and wait for Enter
-        stop_event = threading.Event()
 
         def wait_for_enter():
             input()
@@ -501,60 +548,144 @@ class AxisTerminal:
         enter_thread.start()
 
         try:
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
-                                 device=INPUT_DEVICE_NAME):
+            with sd.InputStream(samplerate=samplerate, channels=1, dtype='float32',
+                                 callback=callback, device=INPUT_DEVICE_NAME):
                 while not stop_event.is_set():
                     sd.sleep(50)
         except Exception as e:
             print(f"  {C.RED}[AUDIO] Error de grabación PTT: {e}{C.RESET}", flush=True)
             return None
 
+        duration = time.time() - record_start
+        print(f"  {C.GRAY}[MIC] PTT terminado — {duration:.2f}s grabados{C.RESET}", flush=True)
         return self.save_audio_buffer(buffer, filename, samplerate)
 
-    def save_audio_buffer(self, buffer, filename, samplerate=16000):
+    def save_audio_buffer(self, buffer, filename, samplerate=44100):
         if not buffer:
             return None
+
         audio_data = np.concatenate(buffer, axis=0).flatten()
         audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        audio_data = (audio_data * 32767).astype(np.int16)
-        filepath   = _p(filename)
+
+        # Resample to 16 kHz — Whisper.cpp works natively at 16 kHz.
+        # Providing pre-resampled audio avoids internal resampling artifacts.
+        if samplerate != WHISPER_SAMPLE_RATE:
+            num_target = int(len(audio_data) * WHISPER_SAMPLE_RATE / samplerate)
+            audio_data = scipy.signal.resample(audio_data, num_target)
+
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        duration_s  = len(audio_int16) / WHISPER_SAMPLE_RATE
+        filepath    = _p(filename)
+
         with wave.open(filepath, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(samplerate)
-            wf.writeframes(audio_data.tobytes())
+            wf.setframerate(WHISPER_SAMPLE_RATE)
+            wf.writeframes(audio_int16.tobytes())
+
+        print(f"  {C.GRAY}[AUDIO] Guardado: {filepath} "
+              f"| {WHISPER_SAMPLE_RATE} Hz | {duration_s:.2f}s{C.RESET}", flush=True)
+
+        # Save a debug copy for manual inspection (aplay last_recording.wav)
+        if DEBUG_AUDIO:
+            debug_path = _p("last_recording.wav")
+            try:
+                import shutil
+                shutil.copy2(filepath, debug_path)
+            except Exception:
+                pass
+
         self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filepath
 
     def transcribe_audio(self, filename):
         self.set_state(BotStates.THINKING, "Transcribiendo audio...")
+
         if not os.path.exists(WHISPER_CLI):
-            print(f"  {C.RED}[ERROR] whisper-cli no encontrado: {WHISPER_CLI}{C.RESET}", flush=True)
-            print(f"  {C.RED}[ERROR] Ejecuta setup.sh para compilar whisper.cpp{C.RESET}", flush=True)
+            print(f"  {C.RED}[STT] whisper-cli no encontrado: {WHISPER_CLI}{C.RESET}", flush=True)
+            print(f"  {C.RED}[STT] Solución: ejecuta setup.sh para compilar whisper.cpp{C.RESET}", flush=True)
             return ""
         if not os.path.exists(WHISPER_MODEL):
-            print(f"  {C.RED}[ERROR] Modelo Whisper no encontrado: {WHISPER_MODEL}{C.RESET}", flush=True)
+            print(f"  {C.RED}[STT] Modelo no encontrado: {WHISPER_MODEL}{C.RESET}", flush=True)
+            model_name = os.path.basename(WHISPER_MODEL)
+            print(f"  {C.RED}[STT] Solución: descarga {model_name} en whisper.cpp/models/{C.RESET}", flush=True)
+            if "small" in model_name:
+                print(f"  {C.YELLOW}[STT] Tip: wget -O whisper.cpp/models/{model_name} "
+                      f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{model_name}{C.RESET}", flush=True)
             return ""
+
+        cmd = [
+            WHISPER_CLI,
+            "-m", WHISPER_MODEL,
+            "-f", filename,
+            "-l", LANGUAGE,          # force Spanish
+            "-t", str(WHISPER_THREADS),
+            "--no-timestamps",       # cleaner output, easier to parse
+            "--print-special", "false",   # suppress <SOT>, <EOT>, etc.
+        ]
+
+        print(f"  {C.GRAY}[STT] Comando: {' '.join(cmd)}{C.RESET}", flush=True)
+        t_start = time.time()
+
         try:
-            result = subprocess.run(
-                [WHISPER_CLI, "-m", WHISPER_MODEL, "-l", LANGUAGE, "-t", "4", "-f", filename],
-                capture_output=True, text=True, timeout=30
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            elapsed = time.time() - t_start
+
             if result.returncode != 0:
-                print(f"  {C.RED}[ERROR] whisper-cli código {result.returncode}: {result.stderr.strip()}{C.RESET}", flush=True)
+                print(f"  {C.RED}[STT] whisper-cli falló (código {result.returncode}){C.RESET}", flush=True)
+                if result.stderr.strip():
+                    print(f"  {C.RED}[STT] stderr: {result.stderr.strip()}{C.RESET}", flush=True)
                 return ""
-            lines = result.stdout.strip().split('\n')
-            if lines and lines[-1].strip():
-                last = lines[-1].strip()
-                transcription = last.split("]")[1].strip() if ']' in last else last
+
+            raw_output = result.stdout.strip()
+
+            if DEBUG_AUDIO and raw_output:
+                print(f"  {C.GRAY}[STT] Salida bruta ({elapsed:.1f}s):{C.RESET}", flush=True)
+                for line in raw_output.splitlines():
+                    print(f"    {C.GRAY}{line}{C.RESET}", flush=True)
+
+            # Collect all non-empty transcript lines.
+            # With --no-timestamps, output looks like plain text lines.
+            # Without it, lines look like: [00:00:00.000 --> 00:00:03.000]  text
+            # We handle both formats for robustness.
+            transcript_parts = []
+            for line in raw_output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # Skip whisper.cpp header/info lines (they start with 'whisper_' or 'system_')
+                if re.match(r'^(whisper_|system_|main:|\[INST\])', line):
+                    continue
+                # If timestamps were included despite --no-timestamps (older builds),
+                # strip the timestamp prefix: [00:00:00.000 --> 00:00:03.000]
+                line = re.sub(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]\s*', '', line)
+                # Skip lines that are just special tokens
+                if re.match(r'^\[.*\]$', line):
+                    continue
+                if line:
+                    transcript_parts.append(line)
+
+            transcription = " ".join(transcript_parts).strip()
+            # Collapse multiple spaces
+            transcription = re.sub(r'\s+', ' ', transcription)
+
+            if transcription:
+                print(f"  {C.GREEN}[STT] Transcripción: \"{transcription}\"{C.RESET}", flush=True)
             else:
-                transcription = ""
-            return transcription.strip()
+                print(f"  {C.YELLOW}[STT] Sin transcripción — audio vacío o inaudible.{C.RESET}", flush=True)
+                if not DEBUG_AUDIO and raw_output:
+                    # Show raw output on failure even if debug is off
+                    print(f"  {C.GRAY}[STT] Salida bruta: {raw_output[:300]}{C.RESET}", flush=True)
+
+            return transcription
+
         except subprocess.TimeoutExpired:
-            print(f"  {C.RED}[ERROR] whisper-cli excedió el tiempo de espera.{C.RESET}", flush=True)
+            print(f"  {C.RED}[STT] whisper-cli excedió el tiempo de espera (60s){C.RESET}", flush=True)
+            print(f"  {C.YELLOW}[STT] Tip: usa un modelo más pequeño o reduce --threads{C.RESET}", flush=True)
             return ""
         except Exception as e:
-            print(f"  {C.RED}[ERROR] Transcripción fallida: {e}{C.RESET}", flush=True)
+            print(f"  {C.RED}[STT] Error inesperado: {e}{C.RESET}", flush=True)
+            traceback.print_exc()
             return ""
 
     # -------------------------------------------------------------------------

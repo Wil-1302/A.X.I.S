@@ -112,16 +112,28 @@ else
     echo -e "${GREEN}  whisper-cli already built.${NC}"
 fi
 
-# Download Whisper model — multilingual base (supports Spanish and other languages)
-# Use ggml-base.bin instead of ggml-base.en.bin for multi-language STT
-echo -e "${YELLOW}  Descargando modelo Whisper (ggml-base multilingüe)...${NC}"
+# Download Whisper models
+# ggml-small.bin (~244 MB) — recommended for Spanish, much better accuracy than base
+# ggml-base.bin  (~74 MB)  — fallback, lower accuracy
 mkdir -p whisper.cpp/models
+
+echo -e "${YELLOW}  Descargando modelo Whisper (ggml-small — recomendado para español)...${NC}"
+if [ ! -f "whisper.cpp/models/ggml-small.bin" ]; then
+    wget -O whisper.cpp/models/ggml-small.bin \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+    echo -e "${GREEN}  Modelo ggml-small descargado.${NC}"
+else
+    echo -e "${GREEN}  ggml-small ya presente.${NC}"
+fi
+
+# Keep base model as fallback (small download)
+echo -e "${YELLOW}  Descargando modelo Whisper (ggml-base — fallback)...${NC}"
 if [ ! -f "whisper.cpp/models/ggml-base.bin" ]; then
     wget -O whisper.cpp/models/ggml-base.bin \
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
-    echo -e "${GREEN}  Modelo Whisper descargado.${NC}"
+    echo -e "${GREEN}  Modelo ggml-base descargado.${NC}"
 else
-    echo -e "${GREEN}  Modelo Whisper ya presente.${NC}"
+    echo -e "${GREEN}  ggml-base ya presente.${NC}"
 fi
 
 # 6. Python Virtual Environment + Dependencies
@@ -163,14 +175,17 @@ check_file() {
 }
 
 check_file "whisper.cpp/build/bin/whisper-cli"    "whisper-cli binary"
-check_file "whisper.cpp/models/ggml-base.bin"     "whisper model (multilingüe)"
+check_file "whisper.cpp/models/ggml-small.bin"    "whisper model (ggml-small — recomendado para español)"
+check_file "whisper.cpp/models/ggml-base.bin"     "whisper model (ggml-base — fallback)"
 check_file "piper/piper"                           "piper TTS binary"
 check_file "piper/es_ES-davefx-medium.onnx"        "piper voice model (español)"
 check_file "wakeword.onnx"                         "wake word model"
 
 echo ""
 if [ $ERRORS -eq 0 ]; then
-    echo -e "${GREEN}✨ Setup complete! Run: source venv/bin/activate && python agent.py${NC}"
+    echo -e "${GREEN}✨ Setup completo. Ejecuta:${NC}"
+    echo -e "${GREEN}   source venv/bin/activate && python axis.py${NC}"
 else
-    echo -e "${RED}⚠️  Setup completed with ${ERRORS} missing component(s). See above.${NC}"
+    echo -e "${RED}⚠️  Setup completado con ${ERRORS} componente(s) faltante(s). Revisa arriba.${NC}"
+    echo -e "${YELLOW}   Cuando estén listos: source venv/bin/activate && python axis.py${NC}"
 fi
