@@ -177,7 +177,7 @@ def banner():
     print("  ╔═══════════════════════════════════════╗", flush=True)
     print("  ║   A . X . I . S .                    ║", flush=True)
     print("  ║   Autonomous eXtended Intelligence   ║", flush=True)
-    print("  ║   System  —  Arch Linux  —  v0.7     ║", flush=True)
+    print("  ║   System  —  Arch Linux  —  v0.8     ║", flush=True)
     print("  ╚═══════════════════════════════════════╝", flush=True)
     print(f"{C.RESET}", flush=True)
 
@@ -354,11 +354,8 @@ class AxisTerminal:
 
     def run(self):
         self.warm_up_logic()
-        self.tts_active.set()
         self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self.tts_thread.start()
-
-        print(f"\n  {C.GRAY}Presiona Enter o di la palabra de activación para hablar.{C.RESET}\n", flush=True)
 
         while True:
             try:
@@ -414,7 +411,20 @@ class AxisTerminal:
             self.oww_model.reset()
 
         if self.oww_model is None:
-            self.ptt_event.wait()
+            # PTT mode: block on stdin until the user presses Enter.
+            # ptt_event is kept for optional external triggers (hotkey, signal).
+            # If ptt_event is already set (external trigger), use it immediately.
+            if not self.ptt_event.is_set():
+                sys.stdout.write(
+                    f"\n  {C.GRAY}──────────────────────────────────────────────\n"
+                    f"  [ Enter para hablar  |  Ctrl+C para salir ]\n"
+                    f"  ──────────────────────────────────────────────{C.RESET}\n"
+                )
+                sys.stdout.flush()
+                try:
+                    sys.stdin.readline()
+                except (EOFError, KeyboardInterrupt):
+                    raise KeyboardInterrupt
             self.ptt_event.clear()
             return "PTT"
 
@@ -457,7 +467,17 @@ class AxisTerminal:
                             return "WAKE"
         except Exception as e:
             print(f"  {C.YELLOW}[AVISO] Error en detección de wake word: {e}{C.RESET}", flush=True)
-            self.ptt_event.wait()
+            # Wake word stream failed — fall back to PTT mode for this turn.
+            sys.stdout.write(
+                f"\n  {C.GRAY}──────────────────────────────────────────────\n"
+                f"  [ Enter para hablar  |  Ctrl+C para salir ]\n"
+                f"  ──────────────────────────────────────────────{C.RESET}\n"
+            )
+            sys.stdout.flush()
+            try:
+                sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt):
+                raise KeyboardInterrupt
             return "PTT"
 
     def record_voice_adaptive(self, filename="input.wav"):
@@ -773,10 +793,15 @@ class AxisTerminal:
                 content = chunk['message']['content']
                 full_response_buffer += content
 
-                if '{"' in content or "action:" in content.lower():
-                    is_action_mode = True
-                    self.thinking_sound_active.clear()
-                    continue
+                # Detect action mode by checking whether the response STARTS with JSON.
+                # Only switch before we have printed any output — prevents false triggers
+                # on mid-sentence braces in normal prose.
+                if not axis_label_printed and not is_action_mode:
+                    stripped_so_far = full_response_buffer.lstrip()
+                    if stripped_so_far.startswith('{'):
+                        is_action_mode = True
+                        self.thinking_sound_active.clear()
+                        continue
 
                 if is_action_mode:
                     continue
@@ -797,6 +822,12 @@ class AxisTerminal:
                         with self.tts_queue_lock:
                             self.tts_queue.append(clean)
                     sentence_buffer = ""
+
+            # Flush any remaining sentence fragment that had no trailing punctuation.
+            if not is_action_mode and sentence_buffer.strip() and re.search(r'\w', sentence_buffer.strip()):
+                with self.tts_queue_lock:
+                    self.tts_queue.append(sentence_buffer.strip())
+            sentence_buffer = ""
 
             if axis_label_printed:
                 print(flush=True)  # newline after streamed response
@@ -884,9 +915,11 @@ class AxisTerminal:
                 if self.tts_queue:
                     text = self.tts_queue.pop(0)
                     self.tts_active.set()
+                else:
+                    # Queue drained — mark inactive so wait_for_tts() can exit.
+                    self.tts_active.clear()
             if text:
                 self.speak(text)
-                self.tts_active.clear()
             else:
                 time.sleep(0.05)
 
