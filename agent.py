@@ -161,7 +161,7 @@ class BotGUI:
 
     def __init__(self, master):
         self.master = master
-        master.title("Pi Assistant")
+        master.title("A.X.I.S. Assistant")
         master.attributes('-fullscreen', True) 
         master.bind('<Escape>', self.exit_fullscreen)
         
@@ -239,7 +239,8 @@ class BotGUI:
             if match:
                 return json.loads(match.group(0))
             return None
-        except: return None
+        except (json.JSONDecodeError, AttributeError):
+            return None
 
     def safe_exit(self):
         print("\n--- SHUTDOWN SEQUENCE ---", flush=True)
@@ -247,17 +248,19 @@ class BotGUI:
             try:
                 self.current_audio_process.terminate()
                 self.current_audio_process.wait(timeout=1)
-            except: pass
+            except Exception:
+                pass
 
         self.recording_active.clear()
         self.thinking_sound_active.clear()
-        self.tts_active.clear() 
-        
+        self.tts_active.clear()
+
         self.save_chat_history()
-        
+
         try:
             ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
-        except: pass
+        except Exception:
+            pass
 
         self.master.quit()
         sys.exit(0) 
@@ -301,7 +304,7 @@ class BotGUI:
                 self.tts_queue.clear()
             if self.current_audio_process:
                 try: self.current_audio_process.terminate()
-                except: pass
+                except Exception: pass
             self.set_state(BotStates.IDLE, "Interrupted.")
 
     def load_animations(self):
@@ -355,7 +358,8 @@ class BotGUI:
                     self.current_overlay_image = ImageTk.PhotoImage(img)
                     self.overlay_label.config(image=self.current_overlay_image)
                     self.overlay_label.place(x=200, y=90)
-                except: pass
+                except Exception as e:
+                    print(f"[GUI] Overlay error: {e}", flush=True)
             else:
                 self.overlay_label.place_forget()
         self.master.after(0, _update)
@@ -885,9 +889,9 @@ class BotGUI:
         try:
             self.current_audio_process = subprocess.Popen(
                 [PIPER_BIN, "--model", voice_model, "--output-raw"],
-                stdin=subprocess.PIPE, 
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.PIPE
             )
             
             self.current_audio_process.stdin.write(clean.encode() + b'\n')
@@ -896,15 +900,17 @@ class BotGUI:
             try:
                 device_info = sd.query_devices(kind='output')
                 native_rate = int(device_info['default_samplerate'])
-            except:
-                native_rate = 48000 
+            except Exception as e:
+                print(f"[AUDIO] Could not query output device rate: {e}", flush=True)
+                native_rate = 48000
 
             PIPER_RATE = 22050
             use_native_rate = False
-            
+
             try:
                 sd.check_output_settings(device=None, samplerate=PIPER_RATE)
-            except:
+            except Exception as e:
+                print(f"[AUDIO] 22050Hz not supported natively ({e}), resampling from {native_rate}Hz", flush=True)
                 use_native_rate = True
 
             with sd.RawOutputStream(samplerate=native_rate if use_native_rate else PIPER_RATE, 
@@ -927,10 +933,16 @@ class BotGUI:
                 time.sleep(0.5) 
                     
         except Exception as e:
-            print(f"Audio Error: {e}")
+            print(f"[AUDIO] speak() error: {e}", flush=True)
+            traceback.print_exc()
         finally:
-            self.current_volume = 0 
+            self.current_volume = 0
             if self.current_audio_process:
+                if self.current_audio_process.stderr:
+                    err = self.current_audio_process.stderr.read()
+                    if err:
+                        print(f"[PIPER] stderr: {err.decode(errors='replace').strip()}", flush=True)
+                    self.current_audio_process.stderr.close()
                 if self.current_audio_process.stdout: self.current_audio_process.stdout.close()
                 if self.current_audio_process.poll() is None: self.current_audio_process.terminate()
                 self.current_audio_process = None
@@ -961,26 +973,29 @@ class BotGUI:
             try:
                 device_info = sd.query_devices(kind='output')
                 native_rate = int(device_info['default_samplerate'])
-            except:
-                native_rate = 48000 
+            except Exception as e:
+                print(f"[AUDIO] Could not query output device rate: {e}", flush=True)
+                native_rate = 48000
 
             playback_rate = file_sr
             try:
                 sd.check_output_settings(device=None, samplerate=file_sr)
-            except:
+            except Exception:
                 playback_rate = native_rate
                 num_samples = int(len(audio) * (native_rate / file_sr))
                 audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
 
             sd.play(audio, playback_rate)
-            sd.wait() 
-        except: pass
+            sd.wait()
+        except Exception as e:
+            print(f"[AUDIO] play_sound error ({file_path}): {e}", flush=True)
 
     def load_chat_history(self):
         if os.path.exists(MEMORY_FILE):
             try:
                 with open(MEMORY_FILE, "r") as f: return json.load(f)
-            except: pass
+            except Exception as e:
+                print(f"[MEMORY] Could not load chat history (starting fresh): {e}", flush=True)
         return [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def save_chat_history(self):
